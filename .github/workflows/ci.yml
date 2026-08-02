@@ -115,6 +115,10 @@ jobs:
       # is actually exercised on every change instead of silently rotting — it
       # covers exactly the long-lived /meshsub gossip + flow-control paths that
       # several devnet finalization bugs lived in.
+      # Bounded: a deadlocked soak run otherwise holds the job for the workflow
+      # default (observed as 90+ min hangs); the test itself finishes in ~1-2
+      # min, so 10 minutes is generous while converting a hang into a fast fail.
+      timeout-minutes: 10
       run: zig build soak-test --summary all
 
     - name: Build example executables

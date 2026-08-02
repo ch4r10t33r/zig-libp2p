@@ -102,6 +102,48 @@ pub const KnownPeerDialStatus = struct {
     dial_inflight: bool,
 };
 
+/// A `conns` entry the reconciliation sweep flagged as orphaned (#299): still
+/// present in the peer book but absent from the transport's live-connection
+/// snapshot for at least [`reconcile_orphan_grace_ms`]. The caller (the
+/// transport's single coordinator thread) synthesizes the close through the
+/// same host path a real transport close takes, so `peer_disconnected`,
+/// req/resp cleanup, peer-level teardown, and known-peer redial scheduling all
+/// run exactly as if the lost lifecycle event had been delivered.
+pub const OrphanedConn = struct {
+    conn_id: ConnectionId,
+    peer: identity.PeerId,
+};
+
+/// How long a book entry must be continuously missing from the transport's
+/// live snapshot before [`reconcile`] reports it. Two effects: (a) an entry is
+/// reported only after being seen orphaned on at least two sweeps (the first
+/// sighting records a candidate, the report requires a later sweep past the
+/// grace), so a snapshot racing an in-flight establish/close can never orphan
+/// a healthy conn; and (b) the transport's own close-detection paths (which
+/// run every drive lap) always win while the event pipeline is healthy —
+/// reconciliation only fires when an event was genuinely lost.
+pub const reconcile_orphan_grace_ms: i64 = 15_000;
+
+/// Snapshot of the lifecycle emit counters vs the live table sizes (#299).
+/// `conns_established_total - conns_closed_total` should track
+/// `tracked_conns`, and the `*_emitted_total` counters should track what the
+/// embedder observed; a divergence between the two pairs is exactly the
+/// "book believes peers are connected, transport disagrees" drift.
+pub const LifecycleStats = struct {
+    conns_established_total: u64,
+    conns_closed_total: u64,
+    peer_connected_emitted_total: u64,
+    peer_disconnected_emitted_total: u64,
+    close_unknown_conn_total: u64,
+    close_peer_active_skew_total: u64,
+    reconcile_orphans_flagged_total: u64,
+    reconcile_stale_peers_total: u64,
+    /// Current size of the conn table (peer-book side).
+    tracked_conns: usize,
+    /// Current number of peers with >= 1 active connection.
+    connected_peers: usize,
+};
+
 pub const ConnectionManager = struct {
     allocator: std.mem.Allocator,
     swarm: *swarm_mod.Swarm,
@@ -124,6 +166,38 @@ pub const ConnectionManager = struct {
     /// Total trim recommendations emitted across both reason codes (#90 observability).
     trim_recommendations_total: u64 = 0,
 
+    // ── Lifecycle emit-count observability (#299) ───────────────────────────
+    // The devnet wedge behind #299 presented as a peer book that disagreed
+    // with the live transport while NO lifecycle events flowed. These counters
+    // make that divergence measurable: compare what the transport told us
+    // (`conns_established_total` / `conns_closed_total`) and what we told the
+    // embedder (`peer_connected_emitted_total` / `peer_disconnected_emitted_total`)
+    // against the live table sizes via [`lifecycleStats`].
+    /// Connections recorded via [`onConnectionEstablished`].
+    conns_established_total: u64 = 0,
+    /// Connections removed via [`onConnectionClosed`] (reconciled orphans included).
+    conns_closed_total: u64 = 0,
+    /// `peer_connected` events queued to the swarm.
+    peer_connected_emitted_total: u64 = 0,
+    /// `peer_disconnected` events queued to the swarm (reconcile repairs included).
+    peer_disconnected_emitted_total: u64 = 0,
+    /// [`onConnectionClosed`] calls for a conn_id we never recorded (or already
+    /// removed) — the silent early-return path #299 asks to make observable.
+    close_unknown_conn_total: u64 = 0,
+    /// [`onConnectionClosed`] calls that hit `conns`/`peer_active` map skew and
+    /// returned early without emitting `peer_disconnected`.
+    close_peer_active_skew_total: u64 = 0,
+    /// Orphaned conn entries flagged by [`reconcile`] for a synthesized close.
+    reconcile_orphans_flagged_total: u64 = 0,
+    /// Stale `peer_active` entries repaired by [`reconcile`].
+    reconcile_stale_peers_total: u64 = 0,
+    /// conn_id -> wall-ms it was first observed missing from the transport's
+    /// live snapshot ([`reconcile`] grace tracking).
+    orphan_candidates: std.AutoHashMap(ConnectionId, i64),
+    /// peer -> wall-ms it was first observed in `peer_active` with no backing
+    /// `conns` entry ([`reconcile`] grace tracking).
+    stale_peer_candidates: std.HashMap(identity.PeerId, i64, PeerIdContext, std.hash_map.default_max_load_percentage),
+
     pub fn init(allocator: std.mem.Allocator, s: *swarm_mod.Swarm) ConnectionManager {
         return .{
             .allocator = allocator,
@@ -133,6 +207,8 @@ pub const ConnectionManager = struct {
             .peer_active = .init(allocator),
             .protected_peers = .init(allocator),
             .trim_recommended = .init(allocator),
+            .orphan_candidates = .init(allocator),
+            .stale_peer_candidates = .init(allocator),
         };
     }
 
@@ -209,6 +285,25 @@ pub const ConnectionManager = struct {
         self.peer_active.deinit();
         self.protected_peers.deinit();
         self.trim_recommended.deinit();
+        self.orphan_candidates.deinit();
+        self.stale_peer_candidates.deinit();
+    }
+
+    /// Emit-count instrumentation snapshot (#299). Cheap; safe to call from
+    /// the same single thread that applies lifecycle events.
+    pub fn lifecycleStats(self: *const ConnectionManager) LifecycleStats {
+        return .{
+            .conns_established_total = self.conns_established_total,
+            .conns_closed_total = self.conns_closed_total,
+            .peer_connected_emitted_total = self.peer_connected_emitted_total,
+            .peer_disconnected_emitted_total = self.peer_disconnected_emitted_total,
+            .close_unknown_conn_total = self.close_unknown_conn_total,
+            .close_peer_active_skew_total = self.close_peer_active_skew_total,
+            .reconcile_orphans_flagged_total = self.reconcile_orphans_flagged_total,
+            .reconcile_stale_peers_total = self.reconcile_stale_peers_total,
+            .tracked_conns = self.conns.count(),
+            .connected_peers = self.peer_active.count(),
+        };
     }
 
     pub fn setReqResp(self: *ConnectionManager, rr: ?*req_resp_runtime.ReqResp) void {
@@ -385,6 +480,7 @@ pub const ConnectionManager = struct {
         const seq = self.next_seq;
         self.next_seq += 1;
         try self.conns.put(conn_id, .{ .peer = peer, .direction = direction, .seq = seq });
+        self.conns_established_total += 1;
 
         const gop = try self.peer_active.getOrPut(peer);
         const prev = if (gop.found_existing) gop.value_ptr.* else 0;
@@ -395,6 +491,7 @@ pub const ConnectionManager = struct {
                 .direction = direction,
                 .via_relay = opts.via_relay,
             } });
+            self.peer_connected_emitted_total += 1;
         }
 
         // Per-peer cap: if this connection puts us over `max_per_peer`, recommend
@@ -494,6 +591,7 @@ pub const ConnectionManager = struct {
             // double-close races silently and the embedder sees a wedged
             // publish path with no clue why no `peer_disconnected` ever
             // fired (the gossip-asymmetry bug observed against quinn).
+            self.close_unknown_conn_total += 1;
             log.warn(
                 "onConnectionClosed: unknown conn_id={d} reason={s} (already closed or never registered)",
                 .{ conn_id, @tagName(reason) },
@@ -502,9 +600,11 @@ pub const ConnectionManager = struct {
         };
         const peer = ent.value.peer;
         const direction = ent.value.direction;
+        self.conns_closed_total += 1;
         _ = self.trim_recommended.remove(conn_id);
 
         const pr = self.peer_active.getPtr(peer) orelse {
+            self.close_peer_active_skew_total += 1;
             log.warn(
                 "onConnectionClosed: conn_id={d} dir={s} but peer not in peer_active map (skew)",
                 .{ conn_id, @tagName(direction) },
@@ -515,6 +615,7 @@ pub const ConnectionManager = struct {
             // Would underflow — peer_active was already 0 when we still had
             // a `conns` entry. Means the maps are out of sync, log and
             // bail rather than wrapping to u32_max.
+            self.close_peer_active_skew_total += 1;
             log.warn(
                 "onConnectionClosed: conn_id={d} dir={s} peer_active already 0 (map skew); removing entry",
                 .{ conn_id, @tagName(direction) },
@@ -536,6 +637,7 @@ pub const ConnectionManager = struct {
                 .direction = direction,
                 .reason = reason,
             } });
+            self.peer_disconnected_emitted_total += 1;
 
             if (self.req_resp) |rr| {
                 try rr.onPeerDisconnected(peer);
@@ -567,6 +669,138 @@ pub const ConnectionManager = struct {
             );
         }
         return count == 0;
+    }
+
+    /// Reconciliation sweep (#299): compare the peer book against `live` — the
+    /// transport's snapshot of every connection id that currently has a live
+    /// leg — and report entries the book believes are open but the transport
+    /// no longer backs. Covers lifecycle events lost in flight (e.g. dropped
+    /// on coordinator-queue allocation failure) and close transitions the
+    /// transport's own detection missed.
+    ///
+    /// Two divergence classes:
+    ///  * **Orphaned conns** — `conns` entries missing from `live` for
+    ///    [`reconcile_orphan_grace_ms`]. Appended to `out_orphans`; the caller
+    ///    must route each through the normal close path
+    ///    (`host.onConnectionClosed` with reason `.orphaned`) so
+    ///    `peer_disconnected`, req/resp cleanup, peer-level teardown, and
+    ///    known-peer redial scheduling all fire exactly as for a delivered
+    ///    transport close.
+    ///  * **Stale peers** — `peer_active` entries with NO backing `conns`
+    ///    entry (the map-skew early returns in [`onConnectionClosed`] strand
+    ///    these, leaving a peer "connected" forever with zero connections).
+    ///    After the same grace the entry is removed here, a synthetic
+    ///    `peer_disconnected` (direction `.unknown`, reason `.orphaned`) is
+    ///    emitted, req/resp is notified, and the peer is appended to
+    ///    `out_stale_peers` so the caller can run peer-level host teardown
+    ///    (gossipsub / peer_protocols / kad).
+    ///
+    /// NOT thread-safe (like the rest of this struct): call from the single
+    /// thread that applies lifecycle events. This sweep never dials — redial
+    /// policy stays exactly the pre-existing known-peer backoff (see the
+    /// anti-churn scar tissue around `onConnectionClosed`); the learned-address
+    /// redial tier for inbound-only peers is a separate follow-up per #299.
+    pub fn reconcile(
+        self: *ConnectionManager,
+        now_ms: i64,
+        live: *const std.AutoHashMap(ConnectionId, void),
+        out_orphans: *std.ArrayList(OrphanedConn),
+        out_stale_peers: *std.ArrayList(identity.PeerId),
+    ) !void {
+        // Prune orphan candidates that are live again or no longer tracked, so
+        // a transient snapshot miss must restart the full grace window.
+        {
+            var expired: std.ArrayList(ConnectionId) = .empty;
+            defer expired.deinit(self.allocator);
+            var it = self.orphan_candidates.iterator();
+            while (it.next()) |e| {
+                const cid = e.key_ptr.*;
+                if (live.contains(cid) or !self.conns.contains(cid)) {
+                    try expired.append(self.allocator, cid);
+                }
+            }
+            for (expired.items) |cid| _ = self.orphan_candidates.remove(cid);
+        }
+
+        // Flag book entries with no live transport leg; report after grace.
+        {
+            var it = self.conns.iterator();
+            while (it.next()) |e| {
+                const cid = e.key_ptr.*;
+                if (live.contains(cid)) continue;
+                const gop = try self.orphan_candidates.getOrPut(cid);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = now_ms;
+                    continue;
+                }
+                if (now_ms - gop.value_ptr.* < reconcile_orphan_grace_ms) continue;
+                try out_orphans.append(self.allocator, .{ .conn_id = cid, .peer = e.value_ptr.peer });
+                self.reconcile_orphans_flagged_total += 1;
+                // Leave the candidate: the caller's synthesized close removes
+                // the conns entry and the prune above clears it next sweep; if
+                // the close fails we simply re-report.
+            }
+        }
+
+        // Stale peer_active entries: peer marked connected, zero conns entries.
+        var backed = std.HashMap(identity.PeerId, void, PeerIdContext, std.hash_map.default_max_load_percentage).init(self.allocator);
+        defer backed.deinit();
+        {
+            var it = self.conns.valueIterator();
+            while (it.next()) |ent| try backed.put(ent.peer, {});
+        }
+        {
+            var expired: std.ArrayList(identity.PeerId) = .empty;
+            defer expired.deinit(self.allocator);
+            var it = self.stale_peer_candidates.iterator();
+            while (it.next()) |e| {
+                const p = e.key_ptr.*;
+                if (backed.contains(p) or !self.peer_active.contains(p)) {
+                    try expired.append(self.allocator, p);
+                }
+            }
+            for (expired.items) |p| _ = self.stale_peer_candidates.remove(p);
+        }
+        {
+            var flagged: std.ArrayList(identity.PeerId) = .empty;
+            defer flagged.deinit(self.allocator);
+            var it = self.peer_active.keyIterator();
+            while (it.next()) |kp| {
+                const p = kp.*;
+                if (backed.contains(p)) continue;
+                const gop = try self.stale_peer_candidates.getOrPut(p);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = now_ms;
+                    continue;
+                }
+                if (now_ms - gop.value_ptr.* < reconcile_orphan_grace_ms) continue;
+                try flagged.append(self.allocator, p);
+            }
+            for (flagged.items) |p| {
+                log.warn("reconcile: repairing stale peer_active entry (peer marked connected with zero conn entries)", .{});
+                _ = self.peer_active.remove(p);
+                _ = self.stale_peer_candidates.remove(p);
+                try self.swarm.queueEvent(.{ .peer_disconnected = .{
+                    .peer = p,
+                    .direction = .unknown,
+                    .reason = .orphaned,
+                } });
+                self.peer_disconnected_emitted_total += 1;
+                self.reconcile_stale_peers_total += 1;
+                if (self.req_resp) |rr| try rr.onPeerDisconnected(p);
+                // Re-arm the known-peer backoff exactly like a non-local close:
+                // the peer is genuinely gone, and its deadline was parked at
+                // maxInt when the connection established — without this a
+                // repaired known peer would never be redialed (the same drift
+                // in a different coat). Standard capped backoff, no new tier.
+                if (self.known.getPtr(p)) |st| {
+                    st.dial_inflight = false;
+                    st.failure_count +|= 1;
+                    st.next_dial_deadline_ms = now_ms + reconnectDelayMs(st.failure_count, p);
+                }
+                try out_stale_peers.append(self.allocator, p);
+            }
+        }
     }
 };
 
@@ -899,6 +1133,220 @@ test "connection manager notifies ReqResp on last disconnect" {
     try std.testing.expectEqual(error.Disconnected, ev2.rpc_error_response.kind);
     try std.testing.expectEqual(stream_rid, ev2.rpc_error_response.request_id);
     try std.testing.expectEqual(@as(u32, 0), rr.inbound.count());
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation + lifecycle emit-count observability (#299)
+// ---------------------------------------------------------------------------
+
+test "reconciliation emits synthetic close for orphaned conn entry" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    const peer = try identity.PeerId.random();
+    try cm.onConnectionEstablished(7, peer, .inbound, .{});
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.peer_connected, std.meta.activeTag(ev));
+    }
+
+    // Transport truth: no live legs at all (the close event was lost).
+    var live = std.AutoHashMap(ConnectionId, void).init(a);
+    defer live.deinit();
+    var orphans: std.ArrayList(OrphanedConn) = .empty;
+    defer orphans.deinit(a);
+    var stale: std.ArrayList(identity.PeerId) = .empty;
+    defer stale.deinit(a);
+
+    // First sweep only records the candidate — no report before the grace.
+    try cm.reconcile(1_000, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 0), orphans.items.len);
+
+    // Second sweep, still within the grace window: no report.
+    try cm.reconcile(1_000 + reconcile_orphan_grace_ms - 1, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 0), orphans.items.len);
+
+    // Past the grace: the orphan is reported for a synthesized close.
+    try cm.reconcile(1_000 + reconcile_orphan_grace_ms, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 1), orphans.items.len);
+    try std.testing.expectEqual(@as(ConnectionId, 7), orphans.items[0].conn_id);
+    try std.testing.expect(orphans.items[0].peer.eql(&peer));
+    try std.testing.expectEqual(@as(u64, 1), cm.reconcile_orphans_flagged_total);
+    try std.testing.expectEqual(@as(usize, 0), stale.items.len);
+
+    // The caller (transport coordinator) routes the orphan through the normal
+    // close path; the peer's last leg -> fully disconnected, event emitted.
+    try std.testing.expectEqual(true, try cm.onConnectionClosed(20_000, 7, .orphaned));
+    var ev = try swarm.nextEvent(100);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(.peer_disconnected, std.meta.activeTag(ev));
+    try std.testing.expect(ev.peer_disconnected.peer.eql(&peer));
+    try std.testing.expectEqual(peer_events.DisconnectReason.orphaned, ev.peer_disconnected.reason);
+    try std.testing.expect(!cm.hasActiveConnection(peer));
+    try std.testing.expectEqual(@as(usize, 0), cm.conns.count());
+
+    // Next sweep prunes the candidate for the now-closed entry.
+    try cm.reconcile(2_000 + reconcile_orphan_grace_ms, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 0), cm.orphan_candidates.count());
+}
+
+test "reconciliation never flags live conns; a transient miss restarts the grace" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    const peer = try identity.PeerId.random();
+    try cm.onConnectionEstablished(1, peer, .outbound, .{});
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.peer_connected, std.meta.activeTag(ev));
+    }
+
+    var live = std.AutoHashMap(ConnectionId, void).init(a);
+    defer live.deinit();
+    var orphans: std.ArrayList(OrphanedConn) = .empty;
+    defer orphans.deinit(a);
+    var stale: std.ArrayList(identity.PeerId) = .empty;
+    defer stale.deinit(a);
+
+    // Live conn is never flagged, no matter how much time passes.
+    try live.put(1, {});
+    try cm.reconcile(0, &live, &orphans, &stale);
+    try cm.reconcile(10 * reconcile_orphan_grace_ms, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 0), orphans.items.len);
+    try std.testing.expectEqual(@as(usize, 0), cm.orphan_candidates.count());
+
+    // A transient snapshot miss (establish/close race) starts a candidate …
+    live.clearRetainingCapacity();
+    const t0 = 20 * reconcile_orphan_grace_ms;
+    try cm.reconcile(t0, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 0), orphans.items.len);
+    try std.testing.expectEqual(@as(usize, 1), cm.orphan_candidates.count());
+
+    // … but the leg reappearing clears it, so a later miss must run the FULL
+    // grace again instead of inheriting the stale first-seen timestamp.
+    try live.put(1, {});
+    try cm.reconcile(t0 + 1_000, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 0), cm.orphan_candidates.count());
+
+    live.clearRetainingCapacity();
+    try cm.reconcile(t0 + 2_000, &live, &orphans, &stale);
+    // Past the ORIGINAL candidate's grace, but the restart means no report yet.
+    try cm.reconcile(t0 + reconcile_orphan_grace_ms + 1_000, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 0), orphans.items.len);
+    // Full grace from the restart: now it reports.
+    try cm.reconcile(t0 + 2_000 + reconcile_orphan_grace_ms, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 1), orphans.items.len);
+}
+
+test "reconciliation repairs stale peer_active entry (onConnectionClosed skew path)" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    var ma = try multiaddr.Multiaddr.fromString(a, "/ip4/127.0.0.1/udp/4001/quic-v1/p2p/12D3KooWD3eckifWpRn9wQpMG9R9hX3sD158z7EqHWmweQAJU5SA");
+    defer ma.deinit();
+    try cm.registerKnownPeer(&ma, null);
+    const peer = peerIdFromMultiaddr(&ma).?;
+
+    try cm.onConnectionEstablished(3, peer, .inbound, .{});
+    {
+        var ev = try swarm.nextEvent(100);
+        defer ev.deinit(a);
+        try std.testing.expectEqual(.peer_connected, std.meta.activeTag(ev));
+    }
+
+    // Simulate the drift the #299 hazards describe: the conns entry vanished
+    // without the peer_active bookkeeping (direct map mutation, mirroring the
+    // known-peer test setup pattern above). The peer now reads as "connected"
+    // with zero backing connections — permanently, absent reconciliation.
+    _ = cm.conns.remove(3);
+    try std.testing.expect(cm.hasActiveConnection(peer));
+
+    var live = std.AutoHashMap(ConnectionId, void).init(a);
+    defer live.deinit();
+    var orphans: std.ArrayList(OrphanedConn) = .empty;
+    defer orphans.deinit(a);
+    var stale: std.ArrayList(identity.PeerId) = .empty;
+    defer stale.deinit(a);
+
+    try cm.reconcile(1_000, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 0), stale.items.len);
+
+    try cm.reconcile(1_000 + reconcile_orphan_grace_ms, &live, &orphans, &stale);
+    try std.testing.expectEqual(@as(usize, 1), stale.items.len);
+    try std.testing.expect(stale.items[0].eql(&peer));
+    try std.testing.expect(!cm.hasActiveConnection(peer));
+    try std.testing.expectEqual(@as(u64, 1), cm.reconcile_stale_peers_total);
+
+    var ev = try swarm.nextEvent(100);
+    defer ev.deinit(a);
+    try std.testing.expectEqual(.peer_disconnected, std.meta.activeTag(ev));
+    try std.testing.expect(ev.peer_disconnected.peer.eql(&peer));
+    try std.testing.expectEqual(peer_events.DisconnectReason.orphaned, ev.peer_disconnected.reason);
+
+    // Known peer: the repair re-arms the standard capped backoff (no new
+    // redial tier), so the dial scheduler chases the peer again.
+    const st = cm.knownPeerStatus(peer).?;
+    try std.testing.expect(st.failure_count >= 1);
+    try std.testing.expect(st.next_dial_deadline_ms != std.math.maxInt(i64));
+    try std.testing.expect(!st.dial_inflight);
+}
+
+test "lifecycle emit counters track established/closed and unknown-conn closes" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    if (@import("builtin").os.tag == .wasi) return error.SkipZigTest;
+
+    const a = std.testing.allocator;
+    var swarm = try swarm_mod.Swarm.init(a, swarm_mod.default_event_capacity);
+    defer swarm.deinit();
+    try swarm.startBackground();
+
+    var cm = ConnectionManager.init(a, &swarm);
+    defer cm.deinit();
+
+    const peer = try identity.PeerId.random();
+    try cm.onConnectionEstablished(1, peer, .outbound, .{});
+    try cm.onConnectionEstablished(2, peer, .inbound, .{});
+
+    var s = cm.lifecycleStats();
+    try std.testing.expectEqual(@as(u64, 2), s.conns_established_total);
+    try std.testing.expectEqual(@as(u64, 1), s.peer_connected_emitted_total);
+    try std.testing.expectEqual(@as(usize, 2), s.tracked_conns);
+    try std.testing.expectEqual(@as(usize, 1), s.connected_peers);
+
+    _ = try cm.onConnectionClosed(1_000, 1, .remote_close);
+    _ = try cm.onConnectionClosed(1_000, 2, .remote_close);
+    // Unknown conn_id: the silent early-return #299 wants observable.
+    _ = try cm.onConnectionClosed(1_000, 99, .remote_close);
+
+    s = cm.lifecycleStats();
+    try std.testing.expectEqual(@as(u64, 2), s.conns_closed_total);
+    try std.testing.expectEqual(@as(u64, 1), s.peer_disconnected_emitted_total);
+    try std.testing.expectEqual(@as(u64, 1), s.close_unknown_conn_total);
+    try std.testing.expectEqual(@as(usize, 0), s.tracked_conns);
+    try std.testing.expectEqual(@as(usize, 0), s.connected_peers);
 }
 
 // ---------------------------------------------------------------------------

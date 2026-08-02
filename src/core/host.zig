@@ -698,13 +698,21 @@ pub const Host = struct {
         // member on every flap and the heartbeat can never re-graft them (the
         // candidate pool empties → coverage decays below quorum → finality stalls).
         if (fully_disconnected) {
-            self.gossipsub.onPeerDisconnected(peer);
-            self.peer_protocols.removePeer(peer);
-            if (self.kad_dht_client) |kad| {
-                var peer_b58: [128]u8 = undefined;
-                const peer_str = peer.toBase58(&peer_b58) catch return;
-                kad.onPeerDisconnected(peer_str);
-            }
+            self.teardownPeerState(peer);
+        }
+    }
+
+    /// Peer-level teardown shared by the LAST-leg close path above and the
+    /// #299 reconciliation sweep (which repairs `peer_active` entries stranded
+    /// with zero backing connections and must then run the same teardown a
+    /// delivered last-leg close would have run).
+    pub fn teardownPeerState(self: *Host, peer: identity.PeerId) void {
+        self.gossipsub.onPeerDisconnected(peer);
+        self.peer_protocols.removePeer(peer);
+        if (self.kad_dht_client) |kad| {
+            var peer_b58: [128]u8 = undefined;
+            const peer_str = peer.toBase58(&peer_b58) catch return;
+            kad.onPeerDisconnected(peer_str);
         }
     }
 
