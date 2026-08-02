@@ -60,6 +60,17 @@ pub const AutonatRuntimeOptions = config.AutonatRuntimeOptions;
 /// within this window is abandoned and surfaced via `onDialFailure`.
 const dial_handshake_timeout_ms: i64 = 20_000;
 
+/// Cadence of the shard-0 book-vs-transport reconciliation sweep (#299).
+/// Combined with [`connection_manager.reconcile_orphan_grace_ms`] an orphaned
+/// entry is repaired within ~grace + one sweep (≈20 s) of the lost event —
+/// prompt against the multi-hour wedge #299 describes, and slow enough that
+/// the transport's own per-lap close detection always wins when healthy.
+const reconcile_sweep_interval_ms: i64 = 5_000;
+
+/// Cadence of the lifecycle emit-counts-vs-table-sizes log line emitted from
+/// the reconciliation sweep (#299 observability).
+const lifecycle_stats_log_interval_ms: i64 = 60_000;
+
 /// An outbound QUIC dial whose handshake is still in flight. The dial is
 /// advanced **non-blocking** every `driveLoop` tick (alongside the listener,
 /// `pollAccept`, and all established outbounds) until it reaches
@@ -440,6 +451,35 @@ pub const QuicRuntime = struct {
     /// no Mutex; producers/consumers are different drive threads).
     conn_lifecycle_queue: std.ArrayList(ConnLifecycleEvent) = .empty,
     conn_lifecycle_lock: conn_table.SpinLock = .{},
+
+    // ── Lifecycle observability + reconciliation (#299) ────────────────────
+    // Emit-count instrumentation: these counters, compared against the
+    // connection_manager's [`lifecycleStats`] and the live conn-table sizes in
+    // the shard-0 reconciliation sweep's periodic log line, make the "peer
+    // book drifted from live conns with zero lifecycle events" failure mode
+    // directly observable in logs instead of requiring a wedged devnet node.
+    /// Lifecycle events DROPPED because the coordinator-queue append failed
+    /// (allocation failure). Any non-zero value here is the smoking gun for
+    /// book-vs-transport drift; the reconciliation sweep is the backstop that
+    /// repairs the book afterwards. Atomic: incremented from any drive thread.
+    conn_lifecycle_dropped_total: std.atomic.Value(u64) = .init(0),
+    /// `established` lifecycle events enqueued to the coordinator.
+    conn_established_enqueued_total: std.atomic.Value(u64) = .init(0),
+    /// `closed` lifecycle events enqueued to the coordinator.
+    conn_closed_enqueued_total: std.atomic.Value(u64) = .init(0),
+    /// Outbound closes surfaced by [`detectOutboundConnectionClose`].
+    outbound_closes_detected_total: std.atomic.Value(u64) = .init(0),
+    /// Inbound closes surfaced at DRAINING time by
+    /// [`detectInboundConnectionClose`] — the #299 outbound-parity fix. The
+    /// pre-fix inbound path only fired after zquic reaped the conn slot.
+    inbound_draining_closes_total: std.atomic.Value(u64) = .init(0),
+    /// Inbound closes surfaced by the listener reap callback
+    /// ([`onLifecycleClosed`] via `QuicListener.syncSeenFlags`).
+    inbound_reap_closes_total: std.atomic.Value(u64) = .init(0),
+    /// Wall-ms of the last reconciliation sweep. Shard-0 drive thread only.
+    last_reconcile_sweep_ms: i64 = 0,
+    /// Wall-ms of the last lifecycle-stats log line. Shard-0 drive thread only.
+    last_lifecycle_stats_log_ms: i64 = 0,
 
     /// Identify-record coordinator queue (Phase 4). `advanceInboundStreams` runs
     /// on EVERY shard's drive thread, but `recordInboundIdentifyProtocols` ->
@@ -1101,8 +1141,41 @@ pub const QuicRuntime = struct {
         self.conn_lifecycle_lock.lock();
         defer self.conn_lifecycle_lock.unlock();
         self.conn_lifecycle_queue.append(self.allocator, ev) catch |err| {
-            log.err("quic_runtime: conn lifecycle queue append failed: {s}", .{@errorName(err)});
+            // An event lost here is exactly the drift #299 describes: the
+            // transport moved on but the connection_manager's book never heard.
+            // Count it (observability) — the shard-0 reconciliation sweep is
+            // the backstop that repairs the book afterwards.
+            _ = self.conn_lifecycle_dropped_total.fetchAdd(1, .monotonic);
+            log.err("quic_runtime: conn lifecycle queue append failed (event DROPPED; reconciliation sweep will repair): {s}", .{@errorName(err)});
+            return;
         };
+        switch (ev) {
+            .established => _ = self.conn_established_enqueued_total.fetchAdd(1, .monotonic),
+            .closed => _ = self.conn_closed_enqueued_total.fetchAdd(1, .monotonic),
+            .dial_failure => {},
+        }
+    }
+
+    /// #299 observability: lifecycle events dropped on coordinator-queue
+    /// allocation failure (each one is a potential book-vs-transport drift).
+    pub fn lifecycleEventsDroppedCount(self: *const QuicRuntime) u64 {
+        return self.conn_lifecycle_dropped_total.load(.monotonic);
+    }
+
+    /// #299 observability: inbound closes surfaced at DRAINING time (outbound
+    /// parity) rather than waiting for zquic to reap the conn slot.
+    pub fn inboundDrainingClosesCount(self: *const QuicRuntime) u64 {
+        return self.inbound_draining_closes_total.load(.monotonic);
+    }
+
+    /// #299 observability: inbound closes surfaced by the listener reap callback.
+    pub fn inboundReapClosesCount(self: *const QuicRuntime) u64 {
+        return self.inbound_reap_closes_total.load(.monotonic);
+    }
+
+    /// #299 observability: outbound closes surfaced by [`detectOutboundConnectionClose`].
+    pub fn outboundClosesDetectedCount(self: *const QuicRuntime) u64 {
+        return self.outbound_closes_detected_total.load(.monotonic);
     }
 
     fn notifyConnEstablished(
@@ -1179,6 +1252,127 @@ pub const QuicRuntime = struct {
         };
     }
 
+    /// #299 reconciliation: compare the connection_manager's book against the
+    /// live transport tables and synthesize closes for entries no transport
+    /// leg backs (a lifecycle event lost on the coordinator queue, or a close
+    /// transition the per-lap detection missed). Runs ONLY on the shard-0
+    /// coordinator thread — the single thread allowed to touch
+    /// `connection_manager` — every [`reconcile_sweep_interval_ms`].
+    ///
+    /// Live-snapshot rules:
+    ///  * `outbound_by_peer` / `inbound_by_peer` are read under their
+    ///    SpinLocks (same cross-thread contract as `shardHoldsLiveLegLocked`).
+    ///  * A mapped leg whose zquic conn is already draining/`.closed` is NOT
+    ///    counted live: the owning shard's detect* sweeps normally surface it
+    ///    first, but if their edge-transition detection was missed the mapped
+    ///    entry would otherwise pin the book forever. Reading `phase` /
+    ///    `draining` cross-thread is the same benign monotonic-flag read the
+    ///    settled-state test probes rely on: a stale read at worst starts an
+    ///    orphan candidate that the next sweep clears, and the two-sweep grace
+    ///    in `reconcile` absorbs exactly that.
+    ///  * Relay bridge/virtual conn ids are only ever written via the
+    ///    relay/dcutr hooks, which are bound to `&shards[0]` and advanced on
+    ///    shard 0 — this thread — so they are read without locks.
+    ///
+    /// Anti-churn: this sweep NEVER dials. Synthesized closes route through
+    /// `host.onConnectionClosed` with reason `.orphaned`, so redial policy is
+    /// exactly the pre-existing known-peer capped backoff; inbound-only peers
+    /// are not redialed (the learned-address redial tier is the separate #299
+    /// follow-up, gated on the data this instrumentation produces).
+    fn sweepConnReconciliation(self: *QuicRuntime, now_ms: i64) void {
+        var live = std.AutoHashMap(connection_manager_mod.ConnectionId, void).init(self.allocator);
+        defer live.deinit();
+
+        var i: u8 = 0;
+        while (i < self.shard_count) : (i += 1) {
+            const s = &self.shards[i];
+
+            s.outbound_by_peer_lock.lock();
+            var ot = s.outbound_by_peer.valueIterator();
+            while (ot.next()) |v| {
+                const conn = &v.*.outbound.client.conn;
+                if (conn.draining or conn.phase == .closed) continue;
+                live.put(v.*.conn_id, {}) catch {};
+            }
+            s.outbound_by_peer_lock.unlock();
+
+            s.inbound_by_peer_lock.lock();
+            var it_in = s.inbound_by_peer.valueIterator();
+            while (it_in.next()) |ref| {
+                if (ref.conn.draining or ref.conn.phase == .closed) continue;
+                const cid = s.inbound_conn_ids[ref.slot];
+                if (cid == 0) continue;
+                live.put(cid, {}) catch {};
+            }
+            s.inbound_by_peer_lock.unlock();
+
+            var rl_it = s.relayed_conn_by_peer.valueIterator();
+            while (rl_it.next()) |cid| live.put(cid.*, {}) catch {};
+        }
+        var rv_it = self.relay_live.relay_virtual.valueIterator();
+        while (rv_it.next()) |vc| live.put(vc.*.conn_id, {}) catch {};
+
+        var orphans: std.ArrayList(connection_manager_mod.OrphanedConn) = .empty;
+        defer orphans.deinit(self.allocator);
+        var stale_peers: std.ArrayList(identity.PeerId) = .empty;
+        defer stale_peers.deinit(self.allocator);
+
+        const cm = self.host.connection_manager;
+        cm.reconcile(now_ms, &live, &orphans, &stale_peers) catch |err| {
+            log.warn("quic_runtime: reconciliation sweep failed: {s}", .{@errorName(err)});
+            return;
+        };
+
+        for (orphans.items) |o| {
+            var peer_buf: [128]u8 = undefined;
+            log.warn(
+                "quic_runtime: reconciliation closing orphaned conn entry cid={d} peer={s} — book had it open, transport has no live leg (lifecycle event lost?)",
+                .{ o.conn_id, peerBase58(o.peer, &peer_buf) },
+            );
+            self.host.onConnectionClosed(now_ms, o.conn_id, o.peer, .orphaned) catch |err| {
+                log.warn("quic_runtime: reconciliation close failed cid={d}: {s}", .{ o.conn_id, @errorName(err) });
+            };
+        }
+        for (stale_peers.items) |p| {
+            var peer_buf: [128]u8 = undefined;
+            log.warn(
+                "quic_runtime: reconciliation repaired stale peer_active entry peer={s} (marked connected with zero conn entries); running peer teardown",
+                .{peerBase58(p, &peer_buf)},
+            );
+            self.host.teardownPeerState(p);
+        }
+
+        // Emit-count observability (#299): periodic counts-vs-tables line so
+        // the divergence the issue describes is visible in live logs, not just
+        // post-mortems. The per-orphan WARNs above flag active drift instantly.
+        if (now_ms - self.last_lifecycle_stats_log_ms >= lifecycle_stats_log_interval_ms) {
+            self.last_lifecycle_stats_log_ms = now_ms;
+            const st = cm.lifecycleStats();
+            log.info(
+                "quic_runtime: lifecycle stats: transport_live={d} book_conns={d} book_peers={d} est_total={d} closed_total={d} connected_emitted={d} disconnected_emitted={d} unknown_conn_closes={d} skew_closes={d} orphans_flagged={d} stale_peers_repaired={d} enq_est={d} enq_closed={d} enq_dropped={d} out_closes={d} in_draining_closes={d} in_reap_closes={d}",
+                .{
+                    live.count(),
+                    st.tracked_conns,
+                    st.connected_peers,
+                    st.conns_established_total,
+                    st.conns_closed_total,
+                    st.peer_connected_emitted_total,
+                    st.peer_disconnected_emitted_total,
+                    st.close_unknown_conn_total,
+                    st.close_peer_active_skew_total,
+                    st.reconcile_orphans_flagged_total,
+                    st.reconcile_stale_peers_total,
+                    self.conn_established_enqueued_total.load(.monotonic),
+                    self.conn_closed_enqueued_total.load(.monotonic),
+                    self.conn_lifecycle_dropped_total.load(.monotonic),
+                    self.outbound_closes_detected_total.load(.monotonic),
+                    self.inbound_draining_closes_total.load(.monotonic),
+                    self.inbound_reap_closes_total.load(.monotonic),
+                },
+            );
+        }
+    }
+
     // ── Identify-record coordinator (Phase 4) ──────────────────────────────
     //
     // `advanceInboundStreams` runs on EVERY shard, but the identify *record*
@@ -1242,36 +1436,88 @@ pub const QuicRuntime = struct {
         const sh: *Shard = @ptrCast(@alignCast(ctx.?));
         const self = sh.rt;
         if (sh.inbound_conn_notified[slot]) {
-            const peer = sh.inbound_conn_peer[slot] orelse identity.PeerId.random() catch return;
-            const cid = sh.inbound_conn_ids[slot];
-            const now_ms = self.opts.now_ms_fn();
-            self.notifyConnClosed(now_ms, cid, peer, .remote_close);
-            sh.inbound_by_peer_lock.lock();
-            _ = sh.inbound_by_peer.remove(peer);
-            sh.inbound_by_peer_lock.unlock();
-            self.clearOwner(peer, sh.index);
-            // Gate the persistent /meshsub teardown on LAST-leg (transport analog
-            // of the v0.2.45 connection_manager fix). Under sharding a peer holds
-            // up to 2 legs and the stream is bound to ONE (outbound-preferred). A
-            // flap of the OTHER leg must NOT destroy a stream living on the
-            // surviving leg — that silently halts the peer's attestation delivery
-            // (+0/-N coverage decay, never restored → finality stalls 1-2 short of
-            // quorum). Destroy only if the stream was on THIS (closing inbound) leg
-            // OR no other leg survives. If it was on this leg but the peer survives
-            // elsewhere, the next publish lazily reopens on the surviving leg;
-            // replay SUBSCRIBE so the peer re-learns our interest. (inbound_by_peer
-            // was already removed above, so liveLegShardForPeer excludes this leg.)
-            if (sh.persistent_gossip.get(peer)) |g| {
-                const live_leg = self.liveLegShardForPeer(peer) != null;
-                if (g.raw == .inbound or !live_leg) {
-                    self.destroyPersistentGossipStream(sh, peer);
-                    if (live_leg) self.replaySubscribeToPeer(sh, peer);
-                }
-            }
+            // Reached only when [`detectInboundConnectionClose`] did NOT
+            // already surface this close at draining time (it clears
+            // `inbound_conn_notified` when it does) — e.g. zquic reaped the
+            // slot within a single drive lap.
+            _ = self.inbound_reap_closes_total.fetchAdd(1, .monotonic);
+            self.handleInboundConnClosed(sh, slot);
         }
         sh.inbound_conn_notified[slot] = false;
         sh.inbound_conn_peer[slot] = null;
         sh.inbound_conn_ids[slot] = 0;
+    }
+
+    /// Shared inbound-close teardown for listener slot `slot`: notify the host,
+    /// drop the `inbound_by_peer` leg, clear ownership, and gate the persistent
+    /// /meshsub teardown on LAST-leg. Invoked from the listener reap callback
+    /// ([`onLifecycleClosed`]) and from the draining-parity sweep
+    /// ([`detectInboundConnectionClose`], #299). Callers reset the per-slot
+    /// bookkeeping (`inbound_conn_notified`/`_peer`/`_ids`) afterwards.
+    fn handleInboundConnClosed(self: *QuicRuntime, sh: *Shard, slot: usize) void {
+        const peer = sh.inbound_conn_peer[slot] orelse identity.PeerId.random() catch return;
+        const cid = sh.inbound_conn_ids[slot];
+        const now_ms = self.opts.now_ms_fn();
+        self.notifyConnClosed(now_ms, cid, peer, .remote_close);
+        sh.inbound_by_peer_lock.lock();
+        _ = sh.inbound_by_peer.remove(peer);
+        sh.inbound_by_peer_lock.unlock();
+        self.clearOwner(peer, sh.index);
+        // Gate the persistent /meshsub teardown on LAST-leg (transport analog
+        // of the v0.2.45 connection_manager fix). Under sharding a peer holds
+        // up to 2 legs and the stream is bound to ONE (outbound-preferred). A
+        // flap of the OTHER leg must NOT destroy a stream living on the
+        // surviving leg — that silently halts the peer's attestation delivery
+        // (+0/-N coverage decay, never restored → finality stalls 1-2 short of
+        // quorum). Destroy only if the stream was on THIS (closing inbound) leg
+        // OR no other leg survives. If it was on this leg but the peer survives
+        // elsewhere, the next publish lazily reopens on the surviving leg;
+        // replay SUBSCRIBE so the peer re-learns our interest. (inbound_by_peer
+        // was already removed above, so liveLegShardForPeer excludes this leg.)
+        if (sh.persistent_gossip.get(peer)) |g| {
+            const live_leg = self.liveLegShardForPeer(peer) != null;
+            if (g.raw == .inbound or !live_leg) {
+                self.destroyPersistentGossipStream(sh, peer);
+                if (live_leg) self.replaySubscribeToPeer(sh, peer);
+            }
+        }
+    }
+
+    /// Inbound analog of [`detectOutboundConnectionClose`] — the #299
+    /// draining-parity fix.
+    ///
+    /// Outbound close detection counts `draining` as dead (see the
+    /// `cur_closed` rule below), but the inbound path previously fired ONLY
+    /// from the listener reap callback (`syncSeenFlags`), which requires zquic
+    /// to have freed the conn slot (`server.conns[i] == null`). zquic defers
+    /// that reap while the embedder still holds raw-app stream slots on the
+    /// conn, and otherwise until the 3×PTO draining deadline — so an inbound
+    /// leg's `peer_disconnected` trailed the wire-level close by hundreds of
+    /// milliseconds in the good case and indefinitely when the release/reap
+    /// chain was starved (the silent-conn-loss shape #299 describes). Sweep
+    /// the notified listener slots each drive lap and surface the close as
+    /// soon as the conn is draining or `.closed`, mirroring the outbound rule.
+    ///
+    /// The eventual reap callback for the slot is a harmless no-op afterwards
+    /// (`inbound_conn_notified` is already false). Conns stuck pre-`.connected`
+    /// need no handling here: they were never notified (no book entry) and
+    /// zquic reaps them on its own handshake deadline.
+    fn detectInboundConnectionClose(self: *QuicRuntime, sh: *Shard) void {
+        for (0..ZIo.MAX_CONNECTIONS) |slot| {
+            if (!sh.inbound_conn_notified[slot]) continue;
+            // Slot already reaped: the listener callback path owns that case.
+            const conn = sh.listener.server.conns[slot] orelse continue;
+            if (!(conn.draining or conn.phase == .closed)) continue;
+            log.warn(
+                "quic_runtime: inbound QUIC connection closed by remote (cid={d} slot={d} phase={s}); notifying host at draining, not waiting for reap",
+                .{ sh.inbound_conn_ids[slot], slot, @tagName(conn.phase) },
+            );
+            _ = self.inbound_draining_closes_total.fetchAdd(1, .monotonic);
+            self.handleInboundConnClosed(sh, slot);
+            sh.inbound_conn_notified[slot] = false;
+            sh.inbound_conn_peer[slot] = null;
+            sh.inbound_conn_ids[slot] = 0;
+        }
     }
 
     /// Register an established inbound connection with the host exactly once per
@@ -1497,6 +1743,7 @@ pub const QuicRuntime = struct {
                 "quic_runtime: outbound QUIC connection closed by remote (cid={d}); notifying host",
                 .{cid},
             );
+            _ = self.outbound_closes_detected_total.fetchAdd(1, .monotonic);
             self.notifyConnClosed(now_ms, cid, peer, .remote_close);
             self.clearOwner(peer, sh.index);
             // Remove the outbound map entry FIRST so liveLegShardForPeer reflects
@@ -2030,6 +2277,12 @@ pub const QuicRuntime = struct {
             // that triggered the phase transition this tick.
             self.detectOutboundConnectionClose(sh);
 
+            // #299 parity: surface INBOUND closes at draining time too, instead
+            // of waiting for zquic to reap the listener slot (which can trail
+            // the wire-level close by hundreds of ms — or indefinitely when the
+            // raw-app-slot release chain is starved).
+            self.detectInboundConnectionClose(sh);
+
             // Drain hook queue. The queue + the gossipsub outbox + host periodic
             // ticks + relay/dcutr are GLOBAL single-writer state; only shard 0
             // touches them (single shard today → always taken). Per-shard
@@ -2045,6 +2298,17 @@ pub const QuicRuntime = struct {
                 // dial scheduler this iteration.
                 self.drainConnLifecycle();
                 self.drainIdentifyRecords();
+
+                // #299: periodic book-vs-transport reconciliation. AFTER the
+                // lifecycle drain so the connection_manager reflects every
+                // delivered event before it is compared against the live
+                // transport tables, and on this (shard-0 coordinator) thread
+                // because connection_manager is single-threaded.
+                const rec_now = self.opts.now_ms_fn();
+                if (rec_now - self.last_reconcile_sweep_ms >= reconcile_sweep_interval_ms) {
+                    self.last_reconcile_sweep_ms = rec_now;
+                    self.sweepConnReconciliation(rec_now);
+                }
             }
 
             // Drain THIS shard's hook sub-queue (Phase 4): directed work
@@ -6277,6 +6541,134 @@ test "QuicRuntime: two instances exchange a status req/resp over UDP loopback" {
 
     try testing.expect(saw_chunk);
     try testing.expect(saw_end);
+}
+
+test "QuicRuntime: inbound close surfaces at draining (outbound parity) — no peer-book drift (#299)" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    if (builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const a = testing.allocator;
+
+    var bundle_a = try buildTestBundle(a, "a", 0xA7);
+    defer bundle_a.deinit(a);
+    var bundle_b = try buildTestBundle(a, "b", 0xB8);
+    defer bundle_b.deinit(a);
+
+    var host_a = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_a.peer,
+        .gossipsub = .{ .local_peer_id = bundle_a.peer },
+    });
+    defer host_a.destroy();
+    try host_a.startBackground();
+    try testing.expect(host_a.waitUntilReady(5_000));
+
+    var rt_a = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_a,
+        .tls_pem = .{
+            .pem_bytes = .{
+                .cert_pem = bundle_a.cert_pem,
+                .key_pem = bundle_a.key_pem,
+            },
+        },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer rt_a.destroy();
+
+    var host_b = try host_mod.Host.create(.{
+        .allocator = a,
+        .local_peer = bundle_b.peer,
+        .gossipsub = .{ .local_peer_id = bundle_b.peer },
+    });
+    defer host_b.destroy();
+    try host_b.startBackground();
+    try testing.expect(host_b.waitUntilReady(5_000));
+
+    // Destroyed explicitly mid-test (that IS the test); the guard keeps the
+    // teardown path leak-free when an assertion fails before that point.
+    var rt_b_destroyed = false;
+    var rt_b = try QuicRuntime.create(.{
+        .allocator = a,
+        .host = host_b,
+        .tls_pem = .{
+            .pem_bytes = .{
+                .cert_pem = bundle_b.cert_pem,
+                .key_pem = bundle_b.key_pem,
+            },
+        },
+        .listen_multiaddr = "/ip4/127.0.0.1/udp/0/quic-v1",
+    });
+    defer if (!rt_b_destroyed) rt_b.destroy();
+
+    try rt_a.start();
+    try rt_b.start();
+
+    const a_port = rt_a.boundUdpPortIpv4() orelse return error.NoBoundPort;
+
+    // B dials A, so A's ONLY leg to B is INBOUND (A never dials back).
+    var a_peer_b58_buf: [128]u8 = undefined;
+    const a_peer_b58 = try bundle_a.peer.toBase58(&a_peer_b58_buf);
+    const a_ma_str = try std.fmt.allocPrint(a, "/ip4/127.0.0.1/udp/{d}/quic-v1/p2p/{s}", .{ a_port, a_peer_b58 });
+    defer a.free(a_ma_str);
+    var a_ma = try multiaddr.Multiaddr.fromString(a, a_ma_str);
+    defer a_ma.deinit();
+    try rt_b.registerKnownPeer(&a_ma, bundle_a.peer);
+
+    // Wait until A registered B's inbound leg and emitted peer_connected.
+    {
+        var saw_connected = false;
+        const deadline_ms = wall_time.milliTimestamp() + 20_000;
+        while (wall_time.milliTimestamp() < deadline_ms and !saw_connected) {
+            var ev = host_a.nextEvent(200) catch |err| switch (err) {
+                error.Timeout => continue,
+                else => return err,
+            };
+            defer ev.deinit(a);
+            switch (ev) {
+                .peer_connected => |pc| {
+                    try testing.expect(pc.peer.eql(&bundle_b.peer));
+                    try testing.expectEqual(peer_events.Direction.inbound, pc.direction);
+                    saw_connected = true;
+                },
+                else => {},
+            }
+        }
+        try testing.expect(saw_connected);
+    }
+    try testing.expect(rtHasInboundTo(rt_a, bundle_b.peer));
+
+    // Tear B down. Its shard teardown sends CONNECTION_CLOSE on the outbound
+    // leg, which flips A's server-side conn to `draining`. zquic defers the
+    // slot reap (3×PTO draining deadline, longer while the embedder still
+    // holds raw-app stream slots) — pre-fix, A's `peer_disconnected` waited on
+    // that reap (`syncSeenFlags` requires `server.conns[i] == null`).
+    rt_b.destroy();
+    rt_b_destroyed = true;
+
+    // A must surface the close promptly and consistently.
+    var saw_disconnected = false;
+    const deadline_ms = wall_time.milliTimestamp() + 15_000;
+    while (wall_time.milliTimestamp() < deadline_ms and !saw_disconnected) {
+        var ev = host_a.nextEvent(200) catch |err| switch (err) {
+            error.Timeout => continue,
+            else => return err,
+        };
+        defer ev.deinit(a);
+        switch (ev) {
+            .peer_disconnected => |pd| {
+                try testing.expect(pd.peer.eql(&bundle_b.peer));
+                saw_disconnected = true;
+            },
+            else => {},
+        }
+    }
+    try testing.expect(saw_disconnected);
+    // The parity fix must be WHAT detected it: the close fired at draining
+    // time (counter below), not by waiting for the slot reap. The transport
+    // map and the peer book agree again afterwards (no drift).
+    try testing.expect(rt_a.inboundDrainingClosesCount() >= 1);
+    try testing.expect(!rtHasInboundTo(rt_a, bundle_b.peer));
 }
 
 test "QuicRuntime: empty-body /status (lantern shape) still gets a response, not reaped" {

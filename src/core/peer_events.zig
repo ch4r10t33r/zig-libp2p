@@ -15,6 +15,12 @@ pub const DisconnectReason = enum {
     remote_close,
     local_close,
     err,
+    /// Synthesized by the reconciliation sweep (#299): the connection manager
+    /// still tracked the conn but the transport no longer had a live leg for
+    /// it — the real close event was lost (e.g. dropped on coordinator-queue
+    /// allocation failure) or never detected. Distinct from `remote_close` so
+    /// embedders and logs can see that the peer book drifted and was repaired.
+    orphaned,
 };
 
 /// Dial or transport handshake failure (distinct from [`DisconnectReason`] on an established conn).
